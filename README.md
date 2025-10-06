@@ -1,3 +1,4 @@
+openinstruct forked for classmate_CoT
 [![Beaker Experiment Launch](https://github.com/allenai/open-instruct/actions/workflows/beaker-experiment.yml/badge.svg)](https://github.com/allenai/open-instruct/actions/workflows/beaker-experiment.yml) [![build_open_instruct](https://github.com/allenai/open-instruct/actions/workflows/push-image.yml/badge.svg)](https://github.com/allenai/open-instruct/actions/workflows/push-image.yml)
 
 # Training Open Instruction-Following Language Models
