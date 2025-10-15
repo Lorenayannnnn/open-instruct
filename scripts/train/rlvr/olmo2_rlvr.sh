@@ -70,7 +70,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python open_instruct/ppo_vllm_thread_ray_gt
     --local_rollout_forward_batch_size 2 \
     --local_mini_batch_size 8 \
     --local_rollout_batch_size 8 \
-    --actor_num_gpus_per_node 3 \
+    --actor_num_gpus_per_node 7 \
     --vllm_tensor_parallel_size 1 \
     --vllm_gpu_memory_utilization 0.9 \
     --beta 0.1 \
@@ -78,7 +78,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python open_instruct/ppo_vllm_thread_ray_gt
     --output_dir output/olmo2_rlvr_13b \
     --seed 52 \
     --num_evals 3 \
-    --save_freq 120 \
+    --save_freq 240 \
     --reward_model_multiplier 0.0 \
     --gradient_checkpointing \
     --with_tracking
