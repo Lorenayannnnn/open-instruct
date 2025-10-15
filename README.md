@@ -62,6 +62,11 @@ docker build . \
 	--build-arg GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD) \
 	-t open_instruct_dev
 
+docker build . \
+    --build-arg GIT_COMMIT=adf7556 \
+	--build-arg GIT_BRANCH=main \
+	-t open_instruct_dev
+
 # if you are internally at AI2, you can create a beaker image like this:
 beaker_user=$(beaker account whoami --format json | jq -r '.[0].name')
 beaker image delete $beaker_user/open_instruct_dev

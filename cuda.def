@@ -1,0 +1,62 @@
+Bootstrap: docker
+From: nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+    export TZ=America/Los_Angeles
+    export NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute
+    export UV_CACHE_DIR=/root/.cache/uv
+    export HF_HUB_ENABLE_HF_TRANSFER=1
+    export UV_COMPILE_BYTECODE=0
+    export BEAKER_VERSION=v1.5.235
+    export PATH=/stage/.venv/bin:$PATH
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential curl wget git make sudo nginx ca-certificates gnupg \
+    && mkdir -p /etc/nginx/conf.d \
+    && rm -rf /var/lib/apt/lists/*
+
+    # MFT
+    MFT_VER=4.31.0-149
+    wget https://www.mellanox.com/downloads/MFT/mft-${MFT_VER}-x86_64-deb.tgz
+    tar -xzf mft-${MFT_VER}-x86_64-deb.tgz
+    mft-${MFT_VER}-x86_64-deb/install.sh --without-kernel
+    rm -f mft-${MFT_VER}-x86_64-deb.tgz
+
+    # DOCA/OFED userspace
+    DOFED_VER=2.10.0
+    OS_VER=ubuntu2204
+    wget https://www.mellanox.com/downloads/DOCA/DOCA_v${DOFED_VER}/host/doca-host_${DOFED_VER}-093000-25.01-${OS_VER}_amd64.deb
+    dpkg -i doca-host_${DOFED_VER}-093000-25.01-${OS_VER}_amd64.deb || true
+    apt-get update && apt-get install -y --no-install-recommends doca-ofed-userspace
+    rm -f doca-host_${DOFED_VER}-093000-25.01-${OS_VER}_amd64.deb
+
+    # Google Cloud CLI
+    install -d /usr/share/keyrings
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] http://packages.cloud.google.com/apt cloud-sdk main" \
+        > /etc/apt/sources.list.d/google-cloud-sdk.list
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+        | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+    apt-get update && apt-get install -y --no-install-recommends google-cloud-sdk
+    rm -rf /var/lib/apt/lists/*
+
+    # Beaker CLI
+    curl -sSL \
+      "https://beaker.org/api/v3/release/cli?os=linux&arch=amd64&version=${BEAKER_VERSION}" \
+      -o /tmp/beaker.tar.gz
+    tar -zxf /tmp/beaker.tar.gz -C /usr/local/bin/ ./beaker
+    rm -f /tmp/beaker.tar.gz
+
+    # uv
+    curl -L https://github.com/astral-sh/uv/releases/download/0.8.6/uv-x86_64-unknown-linux-gnu.tar.gz \
+      -o /tmp/uv.tgz
+    tar -zxf /tmp/uv.tgz -C /usr/local/bin/ uv uvx || true
+    rm -f /tmp/uv.tgz
+
+    mkdir -p /stage
+    cd /stage
+
+%labels
+    GIT_BRANCH "@GIT_BRANCH@"
+    GIT_COMMIT "@GIT_COMMIT@"

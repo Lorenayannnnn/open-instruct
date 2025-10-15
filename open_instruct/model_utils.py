@@ -258,11 +258,95 @@ def get_reward(
     )
 
 
+# async def apply_verifiable_reward(
+#     reward_fn_mapping: Dict[str, VerifierFunction],
+#     responses: List[torch.Tensor],
+#     decoded_responses: List[str],
+#     batch: Batch,
+#     reward_mult: int = 10,
+#     queries: Optional[List[str]] = None,
+# ):
+#     if queries is None:
+#         queries = [None] * len(responses)
+
+#     # Collect all async tasks for parallel execution
+#     async_tasks = []
+#     task_metadata = []
+
+#     for i, (tok_prediction, prediction, ground_truth, dataset, query) in enumerate(
+#         zip(responses, decoded_responses, batch.ground_truths, batch.datasets, queries)
+#     ):
+#         # allow multiple ground truths and datasets for a single response
+
+#         # TODO: both code and lm_judge might have list of ground_truth *per instance*
+#         if isinstance(ground_truth, str):
+#             ground_truth_list = [ground_truth]
+#         else:
+#             ground_truth_list = ground_truth
+#         if isinstance(dataset, str):
+#             dataset_list = [dataset]
+#         else:
+#             dataset_list = dataset
+#         assert len(ground_truth_list) == len(dataset_list), "Ground truth and dataset list lengths do not match."
+
+#         # Create async tasks for each ground truth/dataset pair
+#         for gt, ds in zip(ground_truth_list, dataset_list):
+#             reward_func = reward_fn_mapping.get(ds.lower())
+#             if reward_func is None:
+#                 logger.warning("No reward function found for dataset %s. Skipping reward.", ds)
+#                 continue
+
+#             # Create async task
+#             task = reward_func.async_call(
+#                 tokenized_prediction=tok_prediction, prediction=prediction, label=gt, query=query
+#             )
+#             async_tasks.append(task)
+#             # use reward_func.name to get the name of the verifier, rather than ds in case we have done remapping.
+#             task_metadata.append(
+#                 {
+#                     "response_idx": i,
+#                     "dataset": reward_func.name,
+#                     "reward_weight": reward_func.weight,
+#                     "reward_mult": reward_mult,
+#                 }
+#             )
+
+#     # Execute all tasks in parallel
+#     if async_tasks:
+#         reward_results = await asyncio.gather(*async_tasks)
+#         logger.info(f"Applied {len(reward_results)} ground truth rewards in parallel 🤗")
+#     else:
+#         reward_results = []
+
+#     # Initialize results for each response
+#     response_rewards = [0] * len(responses)
+#     response_per_func_rewards = [{} for _ in range(len(responses))]
+
+#     # Process results
+#     for result, metadata in zip(reward_results, task_metadata):
+#         response_idx = metadata["response_idx"]
+#         dataset = metadata["dataset"]
+#         reward_weight = metadata["reward_weight"]
+#         reward_mult = metadata["reward_mult"]
+
+#         # Extract score from VerificationResult
+#         score = result.score if hasattr(result, "score") else result
+#         weighted_reward = reward_mult * score * reward_weight
+
+#         response_rewards[response_idx] += weighted_reward
+#         response_per_func_rewards[response_idx][dataset] = (
+#             response_per_func_rewards[response_idx].get(dataset, 0) + weighted_reward
+#         )
+
+#     return response_rewards, response_per_func_rewards
+
+
 async def apply_verifiable_reward(
     reward_fn_mapping: Dict[str, VerifierFunction],
     responses: List[torch.Tensor],
     decoded_responses: List[str],
-    batch: Batch,
+    ground_truths: List[str],
+    datasets: List[Union[str, List[str]]],
     reward_mult: int = 10,
     queries: Optional[List[str]] = None,
 ):
@@ -274,7 +358,7 @@ async def apply_verifiable_reward(
     task_metadata = []
 
     for i, (tok_prediction, prediction, ground_truth, dataset, query) in enumerate(
-        zip(responses, decoded_responses, batch.ground_truths, batch.datasets, queries)
+        zip(responses, decoded_responses, ground_truths, datasets, queries)
     ):
         # allow multiple ground truths and datasets for a single response
 
@@ -296,6 +380,12 @@ async def apply_verifiable_reward(
                 logger.warning("No reward function found for dataset %s. Skipping reward.", ds)
                 continue
 
+            # TODO haha comment out
+            # print("🐛 tokenized_prediction", tok_prediction)
+            # print("🐛 prediction", prediction)
+            # print("🐛 gt", gt)
+            # print("🐛 query", query)
+            
             # Create async task
             task = reward_func.async_call(
                 tokenized_prediction=tok_prediction, prediction=prediction, label=gt, query=query

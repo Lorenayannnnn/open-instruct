@@ -33,6 +33,14 @@ import os
 # We need to set NCCL_CUMEM_ENABLE=0 for performance reasons; see:
 # https://github.com/vllm-project/vllm/issues/5723#issuecomment-2554389656
 os.environ["NCCL_CUMEM_ENABLE"] = "0"  # NOQA
+
+# Redirect Ray temp directory to home directory instead of /tmp
+import os
+home_dir = os.path.expanduser("~")
+os.environ["RAY_TMPDIR"] = os.path.join(home_dir, "ray_tmp")  # NOQA
+
+# Disable Ray's distributed debugger to use standard Python debugger
+os.environ["RAY_DEBUGGER_EXTERNAL"] = "1"  # NOQA
 try:
     import deepspeed
     from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
@@ -109,6 +117,7 @@ from open_instruct.model_utils import (
     print_rich_table,
     push_folder_to_hub,
     truncate_response,
+    Batch
 )
 from open_instruct.utils import (
     ArgumentParserPlus,
@@ -120,8 +129,9 @@ from open_instruct.utils import (
     maybe_update_beaker_description,
     maybe_use_ai2_hf_entity,
     maybe_use_ai2_wandb_entity,
-    setup_logger,
+    # setup_logger
 )
+from open_instruct.logger_utils import setup_logger
 from open_instruct.vllm_utils3 import create_vllm_engines, init_process_group
 
 api = HfApi()
@@ -219,7 +229,8 @@ class Args:
     """the mini batch size across GPUs"""
     local_rollout_forward_batch_size: int = 64
     """per rank no grad forward pass in the rollout phase"""
-    reward_model_path: str = "EleutherAI/pythia-160m"
+    # reward_model_path: str = "EleutherAI/pythia-160m"
+    reward_model_path: Optional[str] = None
     """the path to the reward model"""
     reward_model_revision: Optional[str] = None
     """the revision of the reward model"""
@@ -310,7 +321,7 @@ class Args:
     """The wandb's project name"""
     wandb_entity: Optional[str] = None
     """The entity (team) of wandb's project"""
-    push_to_hub: bool = True
+    push_to_hub: bool = False
     """Whether to upload the saved model to huggingface"""
     hf_entity: Optional[str] = None
     """The user or org name of the model repository from the Hugging Face Hub"""
@@ -366,6 +377,10 @@ class Args:
     """the pass rate reward threshold for the code verifier. If pass rate is less than this threshold, reward is 0.0, otherwise reward is pass rate"""
     code_apply_perf_penalty: bool = False
     """whether to apply a performance penalty to the code verifier"""
+
+    # TODO haha -- max length verifier
+    max_length_verifier_max_length: int = 32768
+    """the max length to use for the max length verifier"""
 
 
 def process_dataset_mixer(value) -> Tuple[Optional[dict], Optional[str]]:
@@ -659,7 +674,10 @@ class PolicyTrainerRayProcess(RayProcess):
         torch.cuda.set_device(self.local_rank)
         deepspeed.init_distributed()
 
-        ds_config = get_train_ds_config(offload=False, adam_offload=False, stage=args.deepspeed_stage, bf16=True)
+        # TODO offload
+        # ds_config = get_train_ds_config(offload=False, adam_offload=False, stage=args.deepspeed_stage, bf16=True)
+        ds_config = get_train_ds_config(offload=True, adam_offload=False, stage=args.deepspeed_stage, bf16=True)
+        
         ds_config["train_micro_batch_size_per_gpu"] = args.per_device_train_batch_size
         ds_config["train_batch_size"] = args.mini_batch_size
         # Costa: MAGIC: it's actually needed to initialize this `dschf`, so
@@ -719,38 +737,42 @@ class PolicyTrainerRayProcess(RayProcess):
 
         AutoModelForSequenceClassification.register(Olmo2Config, Olmo2ForSequenceClassification)
         AutoModelForSequenceClassification.register(OlmoeConfig, OlmoeForSequenceClassification)
-        self.value_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
-            args.reward_model_path,
-            revision=args.reward_model_revision,
-            num_labels=1,
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
-            use_cache=False,
-        )
-        if args.init_value_from_scratch:
-            self.value_model.init_weights()  # re-initialize the value model from scratch
-        disable_dropout_in_model(self.value_model)
-        self.value_model.gradient_checkpointing_enable()
-        # AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
-        # AdamOptimizer = FusedAdam
-        # weight_decay = 0.0
-        # optim_params = get_optimizer_grouped_parameters(self.value_model, weight_decay)
-        # self.optimizer = AdamOptimizer(optim_params, lr=args.learning_rate)
-        self.optimizer = torch.optim.AdamW(self.value_model.parameters(), lr=args.learning_rate)
-        scheduler = get_scheduler(
-            args.lr_scheduler_type,
-            optimizer=self.optimizer,
-            num_warmup_steps=warm_up_steps,
-            num_training_steps=num_scheduler_steps,
-        )
-        self.value_model, self.optimizer, _, self.scheduler = deepspeed.initialize(
-            model=self.value_model,
-            optimizer=self.optimizer,
-            config=ds_config,
-            lr_scheduler=scheduler,
-            dist_init_required=True,
-        )
-        self.value_model.train()
+        
+        # TODO modify
+        self.need_value_model = not (args.apply_verifiable_reward or args.reward_model_multiplier != 0.0)
+        if self.need_value_model:
+            self.value_model: PreTrainedModel = AutoModelForSequenceClassification.from_pretrained(
+                args.reward_model_path,
+                revision=args.reward_model_revision,
+                num_labels=1,
+                torch_dtype=torch.bfloat16,
+                attn_implementation="flash_attention_2",
+                use_cache=False,
+            )
+            if args.init_value_from_scratch:
+                self.value_model.init_weights()  # re-initialize the value model from scratch
+            disable_dropout_in_model(self.value_model)
+            self.value_model.gradient_checkpointing_enable()
+            # AdamOptimizer = DeepSpeedCPUAdam if self.adam_offload else FusedAdam
+            # AdamOptimizer = FusedAdam
+            # weight_decay = 0.0
+            # optim_params = get_optimizer_grouped_parameters(self.value_model, weight_decay)
+            # self.optimizer = AdamOptimizer(optim_params, lr=args.learning_rate)
+            self.optimizer = torch.optim.AdamW(self.value_model.parameters(), lr=args.learning_rate)
+            scheduler = get_scheduler(
+                args.lr_scheduler_type,
+                optimizer=self.optimizer,
+                num_warmup_steps=warm_up_steps,
+                num_training_steps=num_scheduler_steps,
+            )
+            self.value_model, self.optimizer, _, self.scheduler = deepspeed.initialize(
+                model=self.value_model,
+                optimizer=self.optimizer,
+                config=ds_config,
+                lr_scheduler=scheduler,
+                dist_init_required=True,
+            )
+            self.value_model.train()
 
         # reference model
         ds_config = get_eval_ds_config(
@@ -849,7 +871,9 @@ class PolicyTrainerRayProcess(RayProcess):
 
         # get list of all reward types in dataset, used for logging
         # sorted to make sure the order is consistent
-        reward_types = sorted(np.unique(np.array(train_dataset["dataset"]).flat))
+        # reward_types = sorted(np.unique(np.array(train_dataset["dataset"]).flat))
+        # TODO haha modify
+        reward_types = sorted(np.unique([ds.lower() for ds in np.array(train_dataset["dataset"]).flat]))
 
         args = self.args
         self.tokenizer = tokenizer
@@ -1074,7 +1098,10 @@ class PolicyTrainerRayProcess(RayProcess):
 
         # for _ in range(1, resume_training_step):  # we didn't store scheduler state
         #     scheduler.step()
-
+        
+        # Initialize training_step in case the loop doesn't execute
+        # TODO haha modify
+        training_step = resume_training_step - 1
         for training_step in range(resume_training_step, args.num_training_steps + 1):
             episode += args.rollout_batch_size * args.number_samples_per_prompt  # each sample is an episode
             queries = queries_next
@@ -1152,7 +1179,8 @@ class PolicyTrainerRayProcess(RayProcess):
                 scores = []
                 verifiable_counts = []
                 sequence_lengths = []
-                values = []
+                if self.need_value_model:
+                    values = []
                 per_func_rewards = {k: [] for k in reward_types}
                 if self.rank == 0:
                     g_response_token_ids = response_ids_Q.get()
@@ -1216,13 +1244,32 @@ class PolicyTrainerRayProcess(RayProcess):
                         ground_truth = ground_truths[i : i + args.local_rollout_forward_batch_size]
                         dataset = datasets[i : i + args.local_rollout_forward_batch_size]
                         decoded_response = tokenizer.batch_decode(postprocessed_response)
+
+                        # Debug: Check ground truth format
+                        # print(f"🐛 Debug ground_truth type: {type(ground_truth)}")
+                        # print(f"🐛 Debug ground_truth sample: {ground_truth[:2] if len(ground_truth) > 0 else 'empty'}")
+                        # print(f"🐛 Debug dataset type: {type(dataset)}")
+                        # print(f"🐛 Debug dataset sample: {dataset[:2] if len(dataset) > 0 else 'empty'}")
+                        
+                        # TODO haha modify
+                        flat_ground_truths = [gt[0] if isinstance(gt, list) and len(gt) > 0 else gt for gt in ground_truth]
+                        flat_datasets = [ds[0] if isinstance(ds, list) and len(ds) > 0 else ds for ds in dataset]
+                        # print(f"🐛 flat_ground_truths: {flat_ground_truths[:2] if len(flat_ground_truths) > 0 else 'empty'}")
+                        # batch = Batch(
+                        #     queries=query,
+                        #     ground_truths=flat_ground_truths,
+                        #     datasets=flat_datasets,
+                        #     raw_queries=None,
+                        #     indices=None,
+                        # )
                         verifiable_reward, per_func_reward = asyncio.run(
                             apply_verifiable_reward(
                                 reward_fn_mapping=reward_fn_mapping,
                                 responses=postprocessed_response,
                                 decoded_responses=decoded_response,
-                                ground_truths=ground_truth,
-                                datasets=dataset,
+                                ground_truths=flat_ground_truths,
+                                datasets=flat_datasets,
+                                # batch=batch,
                                 reward_mult=args.verification_reward,
                             )
                         )
@@ -1232,6 +1279,11 @@ class PolicyTrainerRayProcess(RayProcess):
                         # For each sample, aggregate each per-function reward into a single dict.
                         for reward_dict in per_func_reward:
                             for key, value in reward_dict.items():
+                                # TODO haha remove
+                                # if key not in per_func_rewards:
+                                    # print("🐛 per_func_reward")
+                                    # print(f"🐛 key: {key}, value: {value}")
+                                    # per_func_rewards[key] = []
                                 per_func_rewards[key].append(value)
                     else:
                         verifiable_count = torch.tensor([0.0], device=device).float()
@@ -1239,10 +1291,11 @@ class PolicyTrainerRayProcess(RayProcess):
                     if args.add_r1_style_format_reward:
                         score += format_scores[i : i + args.local_rollout_forward_batch_size]
 
-                    full_value, _, _ = get_reward(
-                        self.value_model, query_response, tokenizer.pad_token_id, context_length
-                    )
-                    value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    if self.need_value_model:
+                        full_value, _, _ = get_reward(
+                            self.value_model, query_response, tokenizer.pad_token_id, context_length
+                        )
+                        value = full_value[:, context_length - 1 : -1].squeeze(-1)
 
                     responses.append(response)
                     postprocessed_responses.append(postprocessed_response)
@@ -1250,7 +1303,8 @@ class PolicyTrainerRayProcess(RayProcess):
                     ref_logprobs.append(ref_logprob)
                     sequence_lengths.append(sequence_length)
                     scores.append(score)
-                    values.append(value)
+                    if self.need_value_model:
+                        values.append(value)
                     verifiable_counts.append(verifiable_count)
 
                 responses = torch.cat(responses, 0)
@@ -1261,8 +1315,10 @@ class PolicyTrainerRayProcess(RayProcess):
                 scores = torch.cat(scores, 0)
                 verifiable_counts = torch.cat(verifiable_counts, 0)
                 verifiable_correct_rate = verifiable_counts.sum() / queries.shape[0]
-                values = torch.cat(values, 0)
-                del (logprob, ref_logprob, full_value, value, score)
+                if self.need_value_model:
+                    values = torch.cat(values, 0)
+                    del (full_value, value)
+                del (logprob, ref_logprob, score)
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -1285,7 +1341,8 @@ class PolicyTrainerRayProcess(RayProcess):
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
                 sequence_lengths_p1 = sequence_lengths + 1
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
-                values = torch.masked_fill(values, padding_mask_p1, 0)
+                if self.need_value_model:
+                    values = torch.masked_fill(values, padding_mask_p1, 0)
 
                 # 4. compute rewards
                 kl1 = logprobs - ref_logprobs
@@ -1315,12 +1372,19 @@ class PolicyTrainerRayProcess(RayProcess):
                 advantages_reversed = []
                 gen_length = responses.shape[1]
                 for t in reversed(range(gen_length)):
-                    nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                    delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                    if self.need_value_model:
+                        nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                        delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
+                    else:
+                        # Without value model, just use the rewards directly  
+                        delta = rewards[:, t]
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
                 advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                returns = advantages + values
+                if self.need_value_model:
+                    returns = advantages + values
+                else:
+                    returns = advantages
                 advantages = masked_whiten(advantages, ~padding_mask)
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
                 torch.cuda.empty_cache()
@@ -1342,25 +1406,26 @@ class PolicyTrainerRayProcess(RayProcess):
                         mb_responses = responses[micro_batch_inds]
                         mb_query_responses = query_responses[micro_batch_inds]
                         mb_logprobs = logprobs[micro_batch_inds]
-                        mb_return = returns[micro_batch_inds]
-                        mb_values = values[micro_batch_inds]
                         mb_padding_mask_p1 = padding_mask_p1[micro_batch_inds]
 
-                        vpred_temp = get_reward(
-                            self.value_model, mb_query_responses, tokenizer.pad_token_id, context_length
-                        )
-                        vpred_temp = vpred_temp[0]
-                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                        vpred = torch.masked_fill(vpred, mb_padding_mask_p1, 0)
-                        vpredclipped = torch.clamp(
-                            vpred, mb_values - args.cliprange_value, mb_values + args.cliprange_value
-                        )
-                        vf_losses1 = torch.square(vpred - mb_return)
-                        vf_losses2 = torch.square(vpredclipped - mb_return)
-                        vf_loss_max = torch.max(vf_losses1, vf_losses2)
-                        vf_loss = 0.5 * masked_mean(vf_loss_max, ~mb_padding_mask_p1)
-                        self.value_model.backward(vf_loss * args.vf_coef)
-                        self.value_model.step()
+                        if self.need_value_model:
+                            mb_values = values[micro_batch_inds]
+                            mb_return = returns[micro_batch_inds]
+                            vpred_temp = get_reward(
+                                self.value_model, mb_query_responses, tokenizer.pad_token_id, context_length
+                            )
+                            vpred_temp = vpred_temp[0]
+                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                            vpred = torch.masked_fill(vpred, mb_padding_mask_p1, 0)
+                            vpredclipped = torch.clamp(
+                                vpred, mb_values - args.cliprange_value, mb_values + args.cliprange_value
+                            )
+                            vf_losses1 = torch.square(vpred - mb_return)
+                            vf_losses2 = torch.square(vpredclipped - mb_return)
+                            vf_loss_max = torch.max(vf_losses1, vf_losses2)
+                            vf_loss = 0.5 * masked_mean(vf_loss_max, ~mb_padding_mask_p1)
+                            self.value_model.backward(vf_loss * args.vf_coef)
+                            self.value_model.step()
 
                         new_logprobs = self.forward(
                             self.model,
@@ -1381,7 +1446,8 @@ class PolicyTrainerRayProcess(RayProcess):
                         self.model.backward(loss)
                         self.model.step()
                         with torch.no_grad():
-                            vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), ~mb_padding_mask_p1)
+                            if self.need_value_model:
+                                vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), ~mb_padding_mask_p1)
                             pg_clipfrac = masked_mean(
                                 (pg_losses2 > pg_losses).float(), ~padding_mask[micro_batch_inds]
                             )
@@ -1392,14 +1458,17 @@ class PolicyTrainerRayProcess(RayProcess):
                             approxkl_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                             pg_clipfrac_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
                             pg_loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                            vf_loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
-                            vf_clipfrac_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
+                            if self.need_value_model:
+                                vf_loss_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
+                                vf_clipfrac_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
                             # entropy_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                             ratio_stats[epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                         gradient_accumulation_idx += 1
                     minibatch_idx += 1
                     # fmt: off
-                    del mb_advantage, mb_responses, mb_query_responses, mb_logprobs, mb_return, mb_values, mb_padding_mask_p1
+                    if self.need_value_model:
+                        del mb_values, mb_return
+                    del mb_advantage, mb_responses, mb_query_responses, mb_logprobs, mb_padding_mask_p1
                     del new_logprobs, logprobs_diff, ratio, pg_losses, pg_losses2, pg_loss_max, pg_loss, loss
                     # fmt: on
                     # del everything and empty cache
@@ -1419,10 +1488,12 @@ class PolicyTrainerRayProcess(RayProcess):
                 local_metrics.add("objective/scores", scores.mean())
                 local_metrics.add("objective/verifiable_correct_rate", verifiable_correct_rate)
                 local_metrics.add("loss/policy_avg", pg_loss_stats.mean())
-                local_metrics.add("loss/value_avg", vf_loss_stats.mean())
+                if self.need_value_model:
+                    local_metrics.add("loss/value_avg", vf_loss_stats.mean())
                 local_metrics.add("policy/approxkl_avg", approxkl_stats.mean())
                 local_metrics.add("policy/clipfrac_avg", pg_clipfrac_stats.mean())
-                local_metrics.add("val/clipfrac_avg", vf_clipfrac_stats.mean())
+                if self.need_value_model:
+                    local_metrics.add("val/clipfrac_avg", vf_clipfrac_stats.mean())
                 local_metrics.add("policy/entropy_avg", entropy_stats.mean())
                 local_metrics.add("val/ratio", ratio_stats.mean())
                 local_metrics.add("val/ratio_var", ratio_stats.var())
@@ -1448,7 +1519,9 @@ class PolicyTrainerRayProcess(RayProcess):
                 if self.rank == 0:
                     print_rich_single_line_metrics(metrics)
                     metrics_queue.put((metrics, episode, df))
-            del (queries, responses, postprocessed_responses, logprobs, ref_logprobs, sequence_lengths, scores, values)
+            if self.need_value_model:
+                del (values)
+            del (queries, responses, postprocessed_responses, logprobs, ref_logprobs, sequence_lengths, scores)
             del (metrics, kl, non_score_reward, non_score_reward_sum, rlhf_reward)
             gc.collect()
             torch.cuda.empty_cache()
@@ -1458,7 +1531,7 @@ class PolicyTrainerRayProcess(RayProcess):
                 checkpoint_dir = f"{args.output_dir}_checkpoints"
                 step_dir = os.path.join(checkpoint_dir, f"step_{training_step}")
                 print(f"Saving model at step {training_step} to {step_dir}")
-                self.save_model(self.model, step_dir)
+                self.save_model(self.model, args.chat_template_name, self.tokenizer, step_dir)
                 if args.try_launch_beaker_eval_jobs_on_weka:
                     leaderboard_name = f"{args.hf_repo_revision}_step_{training_step}"
                     if self.rank == 0 and is_beaker_job():
@@ -1484,7 +1557,10 @@ class PolicyTrainerRayProcess(RayProcess):
                                 print(f"Eval future {eval_futures[0]} is done")
                                 eval_futures.popleft()
         print(f"Saving final model at step {training_step} to {args.output_dir}")
-        self.save_model(self.model, args.output_dir)
+
+        # TODO haha modify
+        # self.save_model(self.model, step_dir)
+        self.save_model(self.model, args.chat_template_name, self.tokenizer, args.output_dir)
         if args.try_launch_beaker_eval_jobs_on_weka:
             leaderboard_name = args.hf_repo_revision
             if self.rank == 0 and is_beaker_job():
@@ -1682,7 +1758,7 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
     args.world_size = sum(args.actor_num_gpus_per_node)
     args.micro_batch_size = int(args.per_device_train_batch_size * args.world_size)
     args.local_total_prompts = args.local_rollout_batch_size * args.number_samples_per_prompt
-    args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size)
+    args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size) 
     args.mini_batch_size = int(args.local_mini_batch_size * args.world_size)
     args.num_mini_batches = exact_div((args.rollout_batch_size * args.number_samples_per_prompt), args.mini_batch_size)
     args.num_training_steps = args.total_episodes // (args.rollout_batch_size * args.number_samples_per_prompt)
@@ -1709,6 +1785,9 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
     if args.with_tracking:
         if args.wandb_entity is None:
             args.wandb_entity = maybe_use_ai2_wandb_entity()
+    
+    # TODO haha modify
+    args.chat_template_name = tc.chat_template_name
 
     # ------------------------------------------------------------
     # Setup experiment tracking and seeds
@@ -1780,6 +1859,11 @@ def main(args: Args, tc: TokenizerConfig, model_config: ModelConfig):
     visualize_token(train_dataset[0][INPUT_IDS_PROMPT_KEY], tokenizer)
 
     # create the model and optimizer
+    # Set Ray temp directory to home directory to avoid /tmp/ access issues
+    ray_temp_dir = os.path.expanduser("~/ray_tmp")
+    os.makedirs(ray_temp_dir, exist_ok=True)
+    os.environ["RAY_TMPDIR"] = ray_temp_dir
+    
     pg = None
     bundles = [{"GPU": actor_num_gpus, "CPU": actor_num_gpus * 10} for actor_num_gpus in args.actor_num_gpus_per_node]
     pg = placement_group(bundles, strategy="STRICT_SPREAD")

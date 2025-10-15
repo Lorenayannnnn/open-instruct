@@ -375,6 +375,16 @@ class LLMRayActor:
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
             if self.verbose:
                 self.logger.info(f"creating LLM with bundle_indices={bundle_indices}")
+        
+
+        # # TODO haha modify
+        # if self.tools:
+        #     from open_instruct.tool_utils.tool_vllm import ToolUseLLM
+
+        #     self.llm = ToolUseLLM(*args, **kwargs)
+        # else:
+        #     from vllm import LLM
+        #     self.llm = LLM(*args, **kwargs)
 
         engine_args = vllm.EngineArgs(*args, **kwargs)
         # Log stats causes a crash in the engine at assert outputs.scheduler_stats is not None when we call step() and there is nothing to step.
@@ -887,6 +897,54 @@ class LLMRayActor:
     def wake_up(self, tags: Optional[list[str]] = None):
         self.llm_engine.wake_up(tags)
 
+    # TODO haha modify
+    # def generate(self, *args, **kwargs):
+        # return self.llm.generate(*args, **kwargs)
+    def generate(self, sampling_params, prompt_token_ids, use_tqdm=False):
+        """Generate responses for given prompts using vLLM engine.
+        
+        Args:
+            sampling_params: SamplingParams object with generation configuration
+            prompt_token_ids: List of token ID lists for prompts
+            use_tqdm: Whether to show progress bar (unused, kept for compatibility)
+            
+        Returns:
+            List of RequestOutput objects containing generated responses
+        """
+        if not prompt_token_ids:
+            return []
+            
+        outputs = []
+        request_ids = []
+        
+        # Add all requests to the engine first
+        for i, prompt_tokens in enumerate(prompt_token_ids):
+            # Create a unique request ID using a more robust approach
+            request_id = f"generate_{id(self)}_{time.time_ns()}_{i}"
+            request_ids.append(request_id)
+            
+            # Create TokensPrompt for vLLM
+            tokens_prompt = vllm.TokensPrompt(prompt_token_ids=prompt_tokens)
+            
+            # Add request to engine
+            self.llm_engine.add_request(request_id, tokens_prompt, sampling_params)
+        
+        # Process all requests until they're all complete
+        completed_ids = set()
+        while len(completed_ids) < len(request_ids):
+            if self.llm_engine.has_unfinished_requests():
+                step_outputs = self.llm_engine.step()
+                for output in step_outputs:
+                    if output.request_id in request_ids and output.finished and output.request_id not in completed_ids:
+                        outputs.append(output)
+                        completed_ids.add(output.request_id)
+        
+        # Sort outputs to match the input order
+        request_id_to_index = {req_id: i for i, req_id in enumerate(request_ids)}
+        outputs.sort(key=lambda x: request_id_to_index[x.request_id])
+        
+        return outputs
+
     def ready(self):
         return True
 
@@ -1015,7 +1073,6 @@ def create_vllm_engines(
             placement_group_capture_child_tasks=True,
             placement_group_bundle_index=bundle_indices[0],
         )
-
         vllm_engines.append(
             ray.remote(LLMRayActor)
             .options(

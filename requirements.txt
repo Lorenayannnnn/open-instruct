@@ -709,7 +709,7 @@ tokenizers==0.21.1
     #   litellm
     #   transformers
     #   vllm
-tomli==2.2.1 ; python_full_version < '3.11'
+# tomli==2.2.1 ; python_full_version < '3.11'
     # via pytest
 torch==2.7.0 ; sys_platform == 'darwin'
     # via
@@ -723,7 +723,7 @@ torch==2.7.0 ; sys_platform == 'darwin'
     #   torchvision
     #   vllm
     #   xgrammar
-torch==2.7.0+cu128 ; sys_platform != 'darwin'
+# torch==2.7.0+cu128 ; sys_platform != 'darwin'
     # via
     #   accelerate
     #   bitsandbytes

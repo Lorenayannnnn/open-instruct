@@ -273,8 +273,8 @@ class StrictMathVerifier(VerifierFunction):
                 return VerificationResult(score=1.0)
         return VerificationResult(score=0.0)
 
-
-class IFEvalVerifier(VerifierFunction):
+# TODO haha modify (original name: IFEvalVerifier)
+class IFEvalVerifierNew(VerifierFunction):
     """
     Verifier for ifeval tasks that delegates evaluation to a function
     specified in the constraint.
@@ -285,14 +285,20 @@ class IFEvalVerifier(VerifierFunction):
     """
 
     def __init__(self, verifier_config: Optional[VerifierConfig] = None) -> None:
-        super().__init__("ifeval", weight=1.0)
+        # super().__init__("ifeval", weight=1.0)
+        super().__init__("ifeval_new", weight=1.0)
 
     def __call__(
         self, tokenized_prediction: List[int], prediction: str, label: Union[str, Dict], query: Optional[str] = None
     ) -> VerificationResult:
         instruction_dict = instructions_registry.INSTRUCTION_DICT
         constraint_dict = ast.literal_eval(label)
-        constraint_dict = constraint_dict[0]
+        # TODO haha
+        # try:
+        #     constraint_dict = ast.literal_eval(label)
+        # except Exception:
+        #     print("🐛 label", label)
+        # constraint_dict = constraint_dict[0]
         if isinstance(constraint_dict, str):
             constraint_dict = json.loads(constraint_dict)
         answer = remove_thinking_section(prediction)
@@ -315,8 +321,8 @@ class IFEvalVerifier(VerifierFunction):
                 rewards.append(0.0)
         return VerificationResult(score=sum(rewards) / len(rewards))
 
-
-class IFEvalVerifierOld(VerifierFunction):
+# TODO haha modify (original name: IFEvalVerifierOld)
+class IFEvalVerifier(VerifierFunction):
     """
     Verifier for ifeval tasks that delegates evaluation to a function
     specified in the constraint.
@@ -326,7 +332,8 @@ class IFEvalVerifierOld(VerifierFunction):
     """
 
     def __init__(self, verifier_config: Optional[VerifierConfig] = None) -> None:
-        super().__init__("ifeval_old", verifier_config=verifier_config, weight=1.0)
+        # super().__init__("ifeval_old", verifier_config=verifier_config, weight=1.0)
+        super().__init__("ifeval", verifier_config=verifier_config, weight=1.0)
 
     def __call__(
         self, tokenized_prediction: List[int], prediction: str, label: Union[str, Dict], query: Optional[str] = None
@@ -944,6 +951,7 @@ class CodeVerifier(VerifierFunction):
 def build_all_verifiers(args) -> Dict[str, VerifierFunction]:
     """
     Build all verifiers with the given judge config.
+    haha
     """
     verifiers: Dict[str, VerifierFunction] = {}
     for subclass in VerifierFunction.__subclasses__():
